@@ -54,7 +54,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{DeviceFd, Point, Rectangle, Scale, Transform};
+use smithay::utils::{DeviceFd, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -399,6 +399,31 @@ struct Surface {
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
+}
+
+impl Surface {
+    /// Pins a split monitor's compositor to its virtual outputs' scale and transform.
+    ///
+    /// The compositor renders the whole physical panel, so its `OutputModeSource::Static`
+    /// must track the bands' scale/transform — otherwise it draws elements at a different
+    /// scale than niri laid them out for, scaling the whole desktop. A single-output
+    /// monitor stays on `OutputModeSource::Auto` and this is a no-op.
+    fn sync_mode_source(&mut self) {
+        // Single-output monitors stay on OutputModeSource::Auto.
+        if self.virtual_outputs.len() <= 1 {
+            return;
+        }
+        let band = &self.virtual_outputs[0];
+        let mode = self.compositor.pending_mode();
+        let size = Size::from((i32::from(mode.size().0), i32::from(mode.size().1)));
+        let scale = band.current_scale().fractional_scale();
+        let transform = band.current_transform();
+        self.compositor.set_output_mode_source(OutputModeSource::Static {
+            size,
+            scale: scale.into(),
+            transform,
+        });
+    }
 }
 
 pub struct SurfaceDmabufFeedback {
@@ -1621,6 +1646,12 @@ impl Tty {
         );
         niri.add_output(monitor, Some(refresh_interval(mode)), vrr_enabled);
 
+        // Pin a split monitor's compositor to its bands' scale/transform now that
+        // `add_output` has applied them.
+        if let Some(surface) = device.surfaces.get_mut(&crtc) {
+            surface.sync_mode_source();
+        }
+
         if niri.monitors_active {
             // Redraw the new monitor.
             let output = outputs[0].clone();
@@ -2771,6 +2802,14 @@ impl Tty {
         for (node, connector, crtc, _name) in to_connect {
             if let Err(err) = self.connector_connected(niri, node, connector, crtc) {
                 warn!("error connecting connector: {err:?}");
+            }
+        }
+
+        // Re-pin split monitors' compositors: a config reload may have changed band
+        // scale/transform, and the compositor must not drift from the bands.
+        for device in self.devices.values_mut() {
+            for surface in device.surfaces.values_mut() {
+                surface.sync_mode_source();
             }
         }
 

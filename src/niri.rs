@@ -1739,8 +1739,11 @@ impl State {
 
         for output in self.niri.global_space.outputs() {
             let name = output.user_data().get::<OutputName>().unwrap();
+            // Resolve config by the physical monitor's name so a split monitor's bands all
+            // pick up the same `output "..."` block (scale, transform, ...).
+            let config_name = self.niri.output_config_name(output);
             let full_config = self.niri.config.borrow_mut();
-            let config = full_config.outputs.find(name);
+            let config = full_config.outputs.find(&config_name);
 
             let scale = config
                 .and_then(|c| c.scale)
@@ -2994,6 +2997,17 @@ impl Niri {
         self.physical_monitors.get(id)
     }
 
+    /// The name to look up an output's `output "..."` config block by.
+    ///
+    /// A virtual output resolves to its physical monitor's name, so that a split monitor's
+    /// bands all share the one config block. Every site that reads per-output config must use
+    /// this, otherwise a band (`DP-4-0`) fails to match its monitor's block (`DP-4`).
+    pub fn output_config_name(&self, output: &Output) -> OutputName {
+        self.physical_monitor_for_output(output)
+            .map(|monitor| monitor.name().clone())
+            .unwrap_or_else(|| output.user_data().get::<OutputName>().unwrap().clone())
+    }
+
     /// Converts a `WlOutput` to a corresponding `Output` if it exists.
     ///
     /// Compared to raw `Output::from_resource`, this method also verifies that the output still
@@ -3176,11 +3190,11 @@ impl Niri {
     }
 
     fn is_inside_hot_corner(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
+        let config_name = self.output_config_name(output);
         let config = self.config.borrow();
-        let hot_corners = output
-            .user_data()
-            .get::<OutputName>()
-            .and_then(|name| config.outputs.find(name))
+        let hot_corners = config
+            .outputs
+            .find(&config_name)
             .and_then(|c| c.hot_corners)
             .unwrap_or(config.gestures.hot_corners);
 
@@ -4851,12 +4865,12 @@ impl Niri {
     pub fn refresh_on_demand_vrr(&mut self, backend: &mut Backend, output: &Output) {
         let _span = tracy_client::span!("Niri::refresh_on_demand_vrr");
 
-        let name = output.user_data().get::<OutputName>().unwrap();
+        let config_name = self.output_config_name(output);
         let on_demand = self
             .config
             .borrow()
             .outputs
-            .find(name)
+            .find(&config_name)
             .is_some_and(|output| output.is_vrr_on_demand());
         if !on_demand {
             return;
