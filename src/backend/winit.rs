@@ -23,6 +23,7 @@ use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState, State};
+use crate::physical_monitor::PhysicalMonitor;
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
@@ -174,7 +175,9 @@ impl Winit {
 
         self.create_dmabuf_global(niri);
 
-        niri.add_output(self.output.clone(), None, false);
+        // winit is a single window: one virtual output spanning the whole monitor.
+        let monitor = PhysicalMonitor::single(&self.output);
+        niri.add_output(monitor, None, false);
     }
 
     pub fn create_dmabuf_global(&mut self, niri: &mut Niri) {

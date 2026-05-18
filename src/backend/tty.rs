@@ -65,6 +65,7 @@ use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
+use crate::physical_monitor::PhysicalMonitor;
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
@@ -1542,7 +1543,9 @@ impl Tty {
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
 
-        niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
+        // tty splitting is not wired up yet: one virtual output spanning the whole monitor.
+        let monitor = PhysicalMonitor::single(&output);
+        niri.add_output(monitor, Some(refresh_interval(mode)), vrr_enabled);
 
         if niri.monitors_active {
             // Redraw the new monitor.

@@ -746,6 +746,7 @@ mod tests {
                 position x=10 y=20
                 mode "1920x1080@144"
                 variable-refresh-rate on-demand=true
+                rows 2
                 background-color "rgba(25, 25, 102, 1.0)"
                 hot-corners {
                     off
@@ -1178,6 +1179,9 @@ mod tests {
                                 on_demand: true,
                             },
                         ),
+                        rows: Some(
+                            2,
+                        ),
                         focus_at_startup: true,
                         background_color: Some(
                             Color {
@@ -1219,6 +1223,7 @@ mod tests {
                         ),
                         modeline: None,
                         variable_refresh_rate: None,
+                        rows: None,
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
@@ -1248,6 +1253,7 @@ mod tests {
                             },
                         ),
                         variable_refresh_rate: None,
+                        rows: None,
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,

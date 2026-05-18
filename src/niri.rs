@@ -144,6 +144,7 @@ use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
 use crate::niri_render_elements;
+use crate::physical_monitor::{PhysicalMonitor, PhysicalMonitorId};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
@@ -256,6 +257,13 @@ pub struct Niri {
     pub blocker_cleared_rx: Receiver<Client>,
 
     pub output_state: HashMap<Output, OutputState>,
+
+    /// Physical monitors, keyed by id.
+    ///
+    /// Each physical monitor hosts one or more virtual outputs (the Smithay `Output`s tracked
+    /// in `output_state`). A virtual output stores its `PhysicalMonitorId` in `user_data()`,
+    /// linking it back here; see `physical_monitor_for_output`.
+    pub physical_monitors: HashMap<PhysicalMonitorId, PhysicalMonitor>,
 
     // When false, we're idling with monitors powered off.
     pub monitors_active: bool,
@@ -2501,6 +2509,7 @@ impl Niri {
             global_space: Space::default(),
             sorted_outputs: Vec::default(),
             output_state: HashMap::new(),
+            physical_monitors: HashMap::new(),
             unmapped_windows: HashMap::new(),
             unmapped_layer_surfaces: HashSet::new(),
             mapped_layer_surfaces: HashMap::new(),
@@ -2686,23 +2695,46 @@ impl Niri {
         #[derive(Debug)]
         struct Data {
             output: Output,
-            name: OutputName,
-            position: Option<Point<i32, Logical>>,
+            monitor: PhysicalMonitorId,
+            monitor_name: OutputName,
             config: Option<niri_config::Position>,
+            // Vertical offset of this output within its monitor, for band stacking.
+            local_y: i32,
+            size: Size<i32, Logical>,
+            prev_position: Option<Point<i32, Logical>>,
         }
 
         let config = self.config.borrow();
+
+        // Compute each virtual output's vertical offset within its physical monitor: a split
+        // monitor's bands stack top to bottom.
+        let mut local_y: HashMap<Output, i32> = HashMap::new();
+        for monitor in self.physical_monitors.values() {
+            let mut y: i32 = 0;
+            for output in monitor.outputs() {
+                local_y.insert(output.clone(), y);
+                y += output_size(output).h.round() as i32;
+            }
+        }
+
         let mut outputs = vec![];
         for output in self.global_space.outputs().chain(new_output) {
-            let name = output.user_data().get::<OutputName>().unwrap();
-            let position = self.global_space.output_geometry(output).map(|geo| geo.loc);
-            let config = config.outputs.find(name).and_then(|c| c.position);
+            let monitor = *output
+                .user_data()
+                .get::<PhysicalMonitorId>()
+                .expect("a virtual output must belong to a physical monitor");
+            let monitor_name = self.physical_monitors[&monitor].name().clone();
+            let position = config.outputs.find(&monitor_name).and_then(|c| c.position);
+            let prev_position = self.global_space.output_geometry(output).map(|geo| geo.loc);
 
             outputs.push(Data {
                 output: output.clone(),
-                name: name.clone(),
-                position,
-                config,
+                monitor,
+                monitor_name,
+                config: position,
+                local_y: local_y.get(output).copied().unwrap_or(0),
+                size: output_size(output).to_i32_round(),
+                prev_position,
             });
         }
         drop(config);
@@ -2717,36 +2749,52 @@ impl Niri {
         // This sorting first compares by make/model/serial so that it is stable regardless of the
         // connector name. However, if make/model/serial is equal or unknown, then it does fall
         // back to comparing the connector name, which should always be unique.
-        outputs.sort_unstable_by(|a, b| a.name.compare(&b.name));
-
-        // Place all outputs with explicitly configured position first, then the unconfigured ones.
-        outputs.sort_by_key(|d| d.config.is_none());
+        //
+        // Outputs with an explicitly configured position go first; the bands of one monitor are
+        // kept together and ordered top to bottom.
+        outputs.sort_by(|a, b| {
+            a.config
+                .is_none()
+                .cmp(&b.config.is_none())
+                .then_with(|| a.monitor_name.compare(&b.monitor_name))
+                .then_with(|| a.local_y.cmp(&b.local_y))
+        });
 
         trace!(
             "placing outputs in order: {:?}",
-            outputs.iter().map(|d| &d.name.connector)
+            outputs.iter().map(|d| &d.monitor_name.connector)
         );
 
-        self.sorted_outputs = outputs
-            .iter()
-            .map(|Data { output, .. }| output.clone())
-            .collect();
+        self.sorted_outputs = outputs.iter().map(|d| d.output.clone()).collect();
 
-        for data in outputs.into_iter() {
-            let Data {
-                output,
-                name,
-                position,
-                config,
-            } = data;
+        // Place one physical monitor at a time: its bands share a single slot and stack
+        // vertically. Monitors are laid out left to right.
+        let mut idx = 0;
+        while idx < outputs.len() {
+            let monitor = outputs[idx].monitor;
+            let group_len = outputs[idx..]
+                .iter()
+                .take_while(|d| d.monitor == monitor)
+                .count();
+            let group = &outputs[idx..idx + group_len];
+            idx += group_len;
 
-            let size = output_size(&output).to_i32_round();
+            // The monitor's bounding box: full width, height is the sum of its bands.
+            let mon_size = Size::from((
+                group.iter().map(|d| d.size.w).max().unwrap_or(0),
+                group
+                    .iter()
+                    .map(|d| d.local_y + d.size.h)
+                    .max()
+                    .unwrap_or(0),
+            ));
 
-            let new_position = config
+            let origin = group[0]
+                .config
                 .map(|pos| Point::from((pos.x, pos.y)))
                 .filter(|pos| {
                     // Ensure that the requested position does not overlap any existing output.
-                    let target_geom = Rectangle::new(*pos, size);
+                    let target_geom = Rectangle::new(*pos, mon_size);
 
                     let overlap = self
                         .global_space
@@ -2759,11 +2807,11 @@ impl Niri {
                             "output {} at x={} y={} sized {}x{} \
                              overlaps an existing output at x={} y={} sized {}x{}, \
                              falling back to automatic placement",
-                            name.connector,
+                            group[0].monitor_name.connector,
                             pos.x,
                             pos.y,
-                            size.w,
-                            size.h,
+                            mon_size.w,
+                            mon_size.h,
                             overlap.loc.x,
                             overlap.loc.y,
                             overlap.size.w,
@@ -2787,23 +2835,56 @@ impl Niri {
                     Point::from((x, 0))
                 });
 
-            self.global_space.map_output(&output, new_position);
+            for data in group {
+                let new_position = origin + Point::from((0, data.local_y));
+                self.global_space.map_output(&data.output, new_position);
 
-            // By passing new_output as an Option, rather than mapping it into a bogus location
-            // in global_space, we ensure that this branch always runs for it.
-            if Some(new_position) != position {
-                debug!(
-                    "putting output {} at x={} y={}",
-                    name.connector, new_position.x, new_position.y
-                );
-                output.change_current_state(None, None, None, Some(new_position));
-                self.ipc_outputs_changed = true;
-                self.queue_redraw(&output);
+                // By passing new_output as an Option, rather than mapping it into a bogus
+                // location in global_space, we ensure that this branch always runs for it.
+                if Some(new_position) != data.prev_position {
+                    debug!(
+                        "putting output {} at x={} y={}",
+                        data.output.name(),
+                        new_position.x,
+                        new_position.y
+                    );
+                    data.output
+                        .change_current_state(None, None, None, Some(new_position));
+                    self.ipc_outputs_changed = true;
+                    self.queue_redraw(&data.output);
+                }
             }
         }
     }
 
-    pub fn add_output(&mut self, output: Output, refresh_interval: Option<Duration>, vrr: bool) {
+    /// Registers a physical monitor and adds all of its virtual outputs.
+    pub fn add_output(
+        &mut self,
+        monitor: PhysicalMonitor,
+        refresh_interval: Option<Duration>,
+        vrr: bool,
+    ) {
+        // Link every virtual output back to its physical monitor, then register the monitor.
+        let monitor_id = monitor.id();
+        let outputs: Vec<Output> = monitor.outputs().to_vec();
+        for output in &outputs {
+            output.user_data().insert_if_missing(|| monitor_id);
+        }
+        let rv = self.physical_monitors.insert(monitor_id, monitor);
+        assert!(rv.is_none(), "physical monitor was already tracked");
+
+        // Add each virtual output. `outputs` is in top-to-bottom band order.
+        for output in outputs {
+            self.add_virtual_output(output, refresh_interval, vrr);
+        }
+    }
+
+    fn add_virtual_output(
+        &mut self,
+        output: Output,
+        refresh_interval: Option<Duration>,
+        vrr: bool,
+    ) {
         let global = output.create_global::<State>(&self.display_handle);
 
         let name = output.user_data().get::<OutputName>().unwrap();
@@ -2887,6 +2968,12 @@ impl Niri {
         self.output_state.contains_key(output)
     }
 
+    /// Returns the physical monitor hosting the given virtual output, if any.
+    pub fn physical_monitor_for_output(&self, output: &Output) -> Option<&PhysicalMonitor> {
+        let id = output.user_data().get::<PhysicalMonitorId>()?;
+        self.physical_monitors.get(id)
+    }
+
     /// Converts a `WlOutput` to a corresponding `Output` if it exists.
     ///
     /// Compared to raw `Output::from_resource`, this method also verifies that the output still
@@ -2908,6 +2995,12 @@ impl Niri {
         self.gamma_control_manager_state.output_removed(output);
 
         let state = self.output_state.remove(output).unwrap();
+
+        // Drop the physical monitor hosting this output. Phase 1 invariant: one output per
+        // monitor, so removing the output removes the monitor.
+        if let Some(id) = output.user_data().get::<PhysicalMonitorId>() {
+            self.physical_monitors.remove(id);
+        }
 
         match state.redraw_state {
             RedrawState::Idle => (),

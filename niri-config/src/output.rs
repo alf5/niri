@@ -65,6 +65,10 @@ pub struct Output {
     pub modeline: Option<Modeline>,
     #[knuffel(child)]
     pub variable_refresh_rate: Option<Vrr>,
+    /// Split this monitor into N equal-height, full-width virtual outputs stacked top to
+    /// bottom. Absent, 0 or 1 means the monitor is a single output (the whole panel).
+    #[knuffel(child, unwrap(argument))]
+    pub rows: Option<u16>,
     #[knuffel(child)]
     pub focus_at_startup: bool,
     // Deprecated; use layout.background_color.
@@ -104,6 +108,7 @@ impl Default for Output {
             mode: None,
             modeline: None,
             variable_refresh_rate: None,
+            rows: None,
             background_color: None,
             backdrop_color: None,
             hot_corners: None,

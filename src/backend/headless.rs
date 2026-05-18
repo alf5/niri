@@ -20,6 +20,7 @@ use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState};
+use crate::physical_monitor::{band_rectangles, PhysicalMonitor};
 use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
 
@@ -62,57 +63,99 @@ impl Headless {
         let connector = format!("headless-{n}");
         let make = "niri".to_string();
         let model = "headless".to_string();
-        let serial = n.to_string();
 
-        let output = Output::new(
-            connector.clone(),
-            PhysicalProperties {
-                size: (0, 0).into(),
-                subpixel: Subpixel::Unknown,
-                make: make.clone(),
-                model: model.clone(),
-                serial_number: serial.clone(),
-            },
-        );
+        let full_size = Size::from((i32::from(size.0), i32::from(size.1)));
 
-        let mode = Mode {
-            size: Size::from((i32::from(size.0), i32::from(size.1))),
-            refresh: 60_000,
+        // The physical monitor is identified by the bare connector name. A config block
+        // `output "headless-N"` can split it into several stacked virtual outputs via `rows`.
+        let monitor_name = OutputName {
+            connector: connector.clone(),
+            make: Some(make.clone()),
+            model: Some(model.clone()),
+            serial: Some(n.to_string()),
         };
-        output.change_current_state(Some(mode), None, None, None);
-        output.set_preferred(mode);
+        let rows = niri
+            .config
+            .borrow()
+            .outputs
+            .find(&monitor_name)
+            .and_then(|o| o.rows)
+            .unwrap_or(1)
+            .max(1);
 
-        output.user_data().insert_if_missing(|| OutputName {
-            connector,
-            make: Some(make),
-            model: Some(model),
-            serial: Some(serial),
-        });
+        let bands = band_rectangles(full_size, rows);
 
-        let physical_properties = output.physical_properties();
-        self.ipc_outputs.lock().unwrap().insert(
-            OutputId::next(),
-            niri_ipc::Output {
-                name: output.name(),
-                make: physical_properties.make,
-                model: physical_properties.model,
-                serial: None,
-                physical_size: None,
-                modes: vec![niri_ipc::Mode {
-                    width: size.0,
-                    height: size.1,
-                    refresh_rate: 60_000,
-                    is_preferred: true,
-                }],
-                current_mode: Some(0),
-                is_custom_mode: true,
-                vrr_supported: false,
-                vrr_enabled: false,
-                logical: Some(logical_output(&output)),
-            },
+        let mut outputs = Vec::with_capacity(bands.len());
+        for (i, band) in bands.iter().enumerate() {
+            // An unsplit monitor keeps the bare connector name; bands are suffixed so that
+            // wl_output names, IPC keys and layout output ids all stay unique.
+            let (out_connector, serial) = if rows == 1 {
+                (connector.clone(), n.to_string())
+            } else {
+                (format!("{connector}-{i}"), format!("{n}.{i}"))
+            };
+
+            let output = Output::new(
+                out_connector.clone(),
+                PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: Subpixel::Unknown,
+                    make: make.clone(),
+                    model: model.clone(),
+                    serial_number: serial.clone(),
+                },
+            );
+
+            let mode = Mode {
+                size: band.size,
+                refresh: 60_000,
+            };
+            output.change_current_state(Some(mode), None, None, None);
+            output.set_preferred(mode);
+
+            output.user_data().insert_if_missing(|| OutputName {
+                connector: out_connector,
+                make: Some(make.clone()),
+                model: Some(model.clone()),
+                serial: Some(serial),
+            });
+
+            let physical_properties = output.physical_properties();
+            self.ipc_outputs.lock().unwrap().insert(
+                OutputId::next(),
+                niri_ipc::Output {
+                    name: output.name(),
+                    make: physical_properties.make,
+                    model: physical_properties.model,
+                    serial: None,
+                    physical_size: None,
+                    modes: vec![niri_ipc::Mode {
+                        width: band.size.w.clamp(0, u16::MAX as i32) as u16,
+                        height: band.size.h.clamp(0, u16::MAX as i32) as u16,
+                        refresh_rate: 60_000,
+                        is_preferred: true,
+                    }],
+                    current_mode: Some(0),
+                    is_custom_mode: true,
+                    vrr_supported: false,
+                    vrr_enabled: false,
+                    logical: Some(logical_output(&output)),
+                },
+            );
+
+            outputs.push(output);
+        }
+
+        let monitor = PhysicalMonitor::new(
+            monitor_name,
+            Some(Mode {
+                size: full_size,
+                refresh: 60_000,
+            }),
+            (0, 0).into(),
+            outputs,
         );
-
-        niri.add_output(output, None, false);
+        niri.add_output(monitor, None, false);
     }
 
     pub fn seat_name(&self) -> String {
