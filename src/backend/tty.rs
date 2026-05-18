@@ -32,6 +32,9 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
+use smithay::backend::renderer::element::utils::{
+    CropRenderElement, Relocate, RelocateRenderElement,
+};
 use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
@@ -51,7 +54,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::{DeviceFd, Point, Rectangle, Scale, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -64,12 +67,16 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
-use crate::niri::{Niri, RedrawState, State};
-use crate::physical_monitor::PhysicalMonitor;
+use crate::niri::{Niri, OutputRenderElements, RedrawState, State};
+use crate::physical_monitor::{band_rectangles, PhysicalMonitor, PhysicalMonitorId};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
-use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
+use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
+use crate::utils::{
+    get_monotonic_time, ipc_transform_to_smithay, is_laptop_panel, logical_output,
+    panel_orientation, PanelOrientation,
+};
 
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 4] = [
     Fourcc::Xrgb8888,
@@ -375,6 +382,10 @@ struct Surface {
     name: OutputName,
     compositor: GbmDrmCompositor,
     connector: connector::Handle,
+    /// Virtual outputs driven by this surface, in top-to-bottom band order.
+    ///
+    /// One element for an unsplit monitor; one per band for a split (`rows > 1`) monitor.
+    virtual_outputs: Vec<Output>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
@@ -1365,32 +1376,90 @@ impl Tty {
         // Update the output mode.
         let (physical_width, physical_height) = connector.size().unwrap_or((0, 0));
 
-        let output = Output::new(
-            connector_name.clone(),
-            PhysicalProperties {
-                size: (physical_width as i32, physical_height as i32).into(),
-                subpixel: connector.subpixel().into(),
-                model: output_name.model.as_deref().unwrap_or("Unknown").to_owned(),
-                make: output_name.make.as_deref().unwrap_or("Unknown").to_owned(),
-                serial_number: output_name
-                    .serial
-                    .as_deref()
-                    .unwrap_or("Unknown")
-                    .to_owned(),
-            },
-        );
-
         let wl_mode = Mode::from(mode);
-        output.change_current_state(Some(wl_mode), None, None, None);
-        output.set_preferred(wl_mode);
 
-        output
-            .user_data()
-            .insert_if_missing(|| TtyOutputState { node, crtc });
-        output.user_data().insert_if_missing(|| output_name.clone());
-        if let Some(x) = orientation {
-            output.user_data().insert_if_missing(|| PanelOrientation(x));
+        // The monitor may be split into several stacked virtual outputs (`rows`).
+        let rows = config.rows.unwrap_or(1).max(1);
+        let bands = band_rectangles(wl_mode.size, rows);
+
+        let mut outputs = Vec::with_capacity(bands.len());
+        for (i, band) in bands.iter().enumerate() {
+            // An unsplit monitor keeps the bare connector identity; bands are suffixed so that
+            // wl_output names, IPC keys and layout output ids stay unique.
+            let (band_connector, band_name) = if rows == 1 {
+                (connector_name.clone(), output_name.clone())
+            } else {
+                let connector = format!("{connector_name}-{i}");
+                let serial = match &output_name.serial {
+                    Some(serial) => format!("{serial}-{i}"),
+                    None => format!("band-{i}"),
+                };
+                let name = OutputName {
+                    connector: connector.clone(),
+                    make: output_name.make.clone(),
+                    model: output_name.model.clone(),
+                    serial: Some(serial),
+                };
+                (connector, name)
+            };
+
+            // Physical size in mm, kept proportional to the band so scale guessing stays sane.
+            let band_mm_h = if wl_mode.size.h > 0 {
+                (i64::from(physical_height) * i64::from(band.size.h) / i64::from(wl_mode.size.h))
+                    as i32
+            } else {
+                0
+            };
+
+            let output = Output::new(
+                band_connector,
+                PhysicalProperties {
+                    size: (physical_width as i32, band_mm_h).into(),
+                    subpixel: connector.subpixel().into(),
+                    model: band_name.model.as_deref().unwrap_or("Unknown").to_owned(),
+                    make: band_name.make.as_deref().unwrap_or("Unknown").to_owned(),
+                    serial_number: band_name.serial.as_deref().unwrap_or("Unknown").to_owned(),
+                },
+            );
+
+            let band_mode = Mode {
+                size: band.size,
+                refresh: wl_mode.refresh,
+            };
+            output.change_current_state(Some(band_mode), None, None, None);
+            output.set_preferred(band_mode);
+
+            output
+                .user_data()
+                .insert_if_missing(|| TtyOutputState { node, crtc });
+            output.user_data().insert_if_missing(|| band_name);
+            if let Some(x) = orientation {
+                output.user_data().insert_if_missing(|| PanelOrientation(x));
+            }
+
+            outputs.push(output);
         }
+
+        // The DRM compositor renders for the whole physical panel. For an unsplit monitor it
+        // tracks the single virtual output; for a split monitor it is pinned to the panel mode.
+        let output_mode_source = if rows == 1 {
+            OutputModeSource::Auto(outputs[0].downgrade())
+        } else {
+            let scale = config.scale.map(|s| s.0).unwrap_or_else(|| {
+                guess_monitor_scale(
+                    (physical_width as i32, physical_height as i32).into(),
+                    wl_mode.size,
+                )
+            });
+            let scale = closest_representable_scale(scale.clamp(0.1, 10.));
+            let transform = panel_orientation(&outputs[0])
+                + ipc_transform_to_smithay(config.transform);
+            OutputModeSource::Static {
+                size: wl_mode.size,
+                scale: scale.into(),
+                transform,
+            }
+        };
 
         let render_node = device.render_node.unwrap_or(self.primary_render_node);
         let renderer = self.gpu_manager.single_renderer(&render_node)?;
@@ -1437,7 +1506,7 @@ impl Tty {
 
         // Create the compositor.
         let res = DrmCompositor::new(
-            OutputModeSource::Auto(output.downgrade()),
+            output_mode_source.clone(),
             surface,
             None,
             device.allocator.clone(),
@@ -1467,7 +1536,7 @@ impl Tty {
                     .create_surface(crtc, mode, &[connector.handle()])?;
 
                 DrmCompositor::new(
-                    OutputModeSource::Auto(output.downgrade()),
+                    output_mode_source.clone(),
                     surface,
                     None,
                     device.allocator.clone(),
@@ -1527,8 +1596,9 @@ impl Tty {
             tracy_client::PlotName::new_leak(format!("{connector_name} sequence delta"));
 
         let surface = Surface {
-            name: output_name,
+            name: output_name.clone(),
             connector: connector.handle(),
+            virtual_outputs: outputs.clone(),
             compositor,
             dmabuf_feedback,
             gamma_props,
@@ -1543,12 +1613,17 @@ impl Tty {
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
 
-        // tty splitting is not wired up yet: one virtual output spanning the whole monitor.
-        let monitor = PhysicalMonitor::single(&output);
+        let monitor = PhysicalMonitor::new(
+            output_name,
+            Some(wl_mode),
+            (physical_width as i32, physical_height as i32).into(),
+            outputs.clone(),
+        );
         niri.add_output(monitor, Some(refresh_interval(mode)), vrr_enabled);
 
         if niri.monitors_active {
             // Redraw the new monitor.
+            let output = outputs[0].clone();
             niri.event_loop.insert_idle(move |state| {
                 // Guard against output disconnecting before the idle has a chance to run.
                 if state.niri.output_state.contains_key(&output) {
@@ -1592,19 +1667,12 @@ impl Tty {
 
         debug!("disconnecting connector: {:?}", surface.name.connector);
 
-        let output = niri
-            .global_space
-            .outputs()
-            .find(|output| {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
-                tty_state.node == node && tty_state.crtc == crtc
-            })
-            .cloned();
-        if let Some(output) = output {
-            niri.remove_output(&output);
-        } else {
+        if surface.virtual_outputs.is_empty() {
             error!("missing output for crtc {crtc:?}");
-        };
+        }
+        for output in &surface.virtual_outputs {
+            niri.remove_output(output);
+        }
     }
 
     fn on_vblank(
@@ -1628,6 +1696,9 @@ impl Tty {
             error!("missing surface in vblank callback for crtc {crtc:?}");
             return;
         };
+
+        // All virtual outputs driven by this surface (a split monitor has several).
+        let outputs: Vec<Output> = surface.virtual_outputs.clone();
 
         // Finish the Tracy frame, if any.
         drop(surface.vblank_frame.take());
@@ -1672,25 +1743,18 @@ impl Tty {
             .unwrap()
             .message(&message, 0);
 
-        let Some(output) = niri
-            .global_space
-            .outputs()
-            .find(|output| {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
-                tty_state.node == node && tty_state.crtc == crtc
-            })
-            .cloned()
-        else {
-            error!("missing output in global space for {name}");
+        let Some(output) = outputs.first().cloned() else {
+            error!("missing output for {name}");
             return;
         };
 
-        let Some(output_state) = niri.output_state.get_mut(&output) else {
-            error!("missing output state for {name}");
+        let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+        let Some(render_state) = niri.monitor_render_state.get_mut(&monitor_id) else {
+            error!("missing monitor render state for {name}");
             return;
         };
 
-        let refresh_interval = output_state.frame_clock.refresh_interval();
+        let refresh_interval = render_state.frame_clock.refresh_interval();
 
         let time = if presentation_time.is_zero() {
             now
@@ -1698,7 +1762,7 @@ impl Tty {
             presentation_time
         };
 
-        if output_state
+        if render_state
             .vblank_throttle
             .throttle(refresh_interval, time, move |state| {
                 let meta = DrmEventMetadata {
@@ -1714,7 +1778,7 @@ impl Tty {
             return;
         }
 
-        let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+        let redraw_needed = match mem::replace(&mut render_state.redraw_state, RedrawState::Idle) {
             RedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
             state @ (RedrawState::Idle
             | RedrawState::Queued
@@ -1738,7 +1802,7 @@ impl Tty {
             Ok(Some((mut feedback, target_presentation_time))) => {
                 let refresh = match refresh_interval {
                     Some(refresh) => {
-                        if output_state.frame_clock.vrr() {
+                        if render_state.frame_clock.vrr() {
                             Refresh::Variable(refresh)
                         } else {
                             Refresh::Fixed(refresh)
@@ -1773,17 +1837,22 @@ impl Tty {
             }
         }
 
-        if let Some(last_sequence) = output_state.last_drm_sequence {
+        if let Some(last_sequence) = render_state.last_drm_sequence {
             let delta = meta.sequence as f64 - last_sequence as f64;
             tracy_client::Client::running()
                 .unwrap()
                 .plot(surface.sequence_delta_plot_name, delta);
         }
-        output_state.last_drm_sequence = Some(meta.sequence);
+        render_state.last_drm_sequence = Some(meta.sequence);
 
-        output_state.frame_clock.presented(presentation_time);
+        render_state.frame_clock.presented(presentation_time);
 
-        if redraw_needed || output_state.unfinished_animations_remain {
+        let animations_remain = outputs.iter().any(|output| {
+            niri.output_state
+                .get(output)
+                .is_some_and(|state| state.unfinished_animations_remain)
+        });
+        if redraw_needed || animations_remain {
             let vblank_frame = tracy_client::Client::running()
                 .unwrap()
                 .non_continuous_frame(surface.vblank_frame_name);
@@ -1791,7 +1860,10 @@ impl Tty {
 
             niri.queue_redraw(&output);
         } else {
-            niri.send_frame_callbacks(&output);
+            // Fan frame callbacks out to every virtual output of the monitor.
+            for output in &outputs {
+                niri.send_frame_callbacks(output);
+            }
         }
     }
 
@@ -1809,14 +1881,16 @@ impl Tty {
         // We waited for the timer, now we can send frame callbacks again.
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
-        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+        let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+        let render_state = niri.monitor_render_state.get_mut(&monitor_id).unwrap();
+        match mem::replace(&mut render_state.redraw_state, RedrawState::Idle) {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => unreachable!(),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
             RedrawState::WaitingForEstimatedVBlank(_) => (),
             // The timer fired just in front of a redraw.
             RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
-                output_state.redraw_state = RedrawState::Queued;
+                render_state.redraw_state = RedrawState::Queued;
                 return;
             }
         }
@@ -1846,12 +1920,20 @@ impl Tty {
     pub fn render(
         &mut self,
         niri: &mut Niri,
-        output: &Output,
+        monitor_id: PhysicalMonitorId,
         target_presentation_time: Duration,
     ) -> RenderResult {
         let span = tracy_client::span!("Tty::render");
 
         let mut rv = RenderResult::Skipped;
+
+        // A split monitor composites all of its virtual outputs into one frame.
+        if niri.physical_monitors[&monitor_id].outputs().len() != 1 {
+            return self.render_split(niri, monitor_id, target_presentation_time);
+        }
+
+        let output = niri.physical_monitors[&monitor_id].output().clone();
+        let output = &output;
 
         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
         let Some(device) = self.devices.get_mut(&tty_state.node) else {
@@ -1921,8 +2003,8 @@ impl Tty {
                 flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
             }
             if debug.skip_cursor_only_updates_during_vrr {
-                let output_state = niri.output_state.get(output).unwrap();
-                if output_state.frame_clock.vrr() {
+                let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+                if niri.monitor_render_state[&monitor_id].frame_clock.vrr() {
                     flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
                 }
             }
@@ -1961,11 +2043,12 @@ impl Tty {
 
                     match drm_compositor.queue_frame(data) {
                         Ok(()) => {
-                            let output_state = niri.output_state.get_mut(output).unwrap();
+                            let render_state =
+                                niri.monitor_render_state.get_mut(&monitor_id).unwrap();
                             let new_state = RedrawState::WaitingForVBlank {
                                 redraw_needed: false,
                             };
-                            match mem::replace(&mut output_state.redraw_state, new_state) {
+                            match mem::replace(&mut render_state.redraw_state, new_state) {
                                 RedrawState::Idle => unreachable!(),
                                 RedrawState::Queued => (),
                                 RedrawState::WaitingForVBlank { .. } => unreachable!(),
@@ -1978,6 +2061,7 @@ impl Tty {
                             // We queued this frame successfully, so the current client buffers were
                             // latched. We can send frame callbacks now, since a new client commit
                             // will no longer overwrite this frame and will wait for a VBlank.
+                            let output_state = niri.output_state.get_mut(output).unwrap();
                             output_state.frame_callback_sequence =
                                 output_state.frame_callback_sequence.wrapping_add(1);
 
@@ -2003,6 +2087,141 @@ impl Tty {
         // Queue a timer to fire at the predicted vblank time.
         queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
 
+        rv
+    }
+
+    /// Renders a split monitor: composites every virtual output into the shared framebuffer.
+    ///
+    /// Each band's elements are offset to its position on the panel and clipped to its band
+    /// rectangle, then all bands are submitted in a single `render_frame`. Unlike the single
+    /// output path this does not use plane scanout.
+    ///
+    /// NOTE: this path has not yet been exercised on real DRM hardware.
+    fn render_split(
+        &mut self,
+        niri: &mut Niri,
+        monitor_id: PhysicalMonitorId,
+        target_presentation_time: Duration,
+    ) -> RenderResult {
+        let _span = tracy_client::span!("Tty::render_split");
+
+        let mut rv = RenderResult::Skipped;
+
+        let outputs: Vec<Output> = niri.physical_monitors[&monitor_id].outputs().to_vec();
+        let tty_state: TtyOutputState = *outputs[0].user_data().get().unwrap();
+
+        let Some(device) = self.devices.get_mut(&tty_state.node) else {
+            error!("missing output device");
+            return rv;
+        };
+        let Some(surface) = device.surfaces.get_mut(&tty_state.crtc) else {
+            error!("missing surface");
+            return rv;
+        };
+        if !device.drm.is_active() {
+            return rv;
+        }
+
+        let mut renderer = match self.gpu_manager.renderer(
+            &self.primary_render_node,
+            &device.render_node.unwrap_or(self.primary_render_node),
+            surface.compositor.format(),
+        ) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                warn!("error creating renderer for primary GPU: {err:?}");
+                return rv;
+            }
+        };
+
+        // Composite each band into the shared physical framebuffer: offset it to its position
+        // on the panel and clip it to its band rectangle.
+        let mut elements: Vec<CropRenderElement<RelocateRenderElement<OutputRenderElements<_>>>> =
+            Vec::new();
+        let mut band_y = 0;
+        for output in &outputs {
+            let Some(mode) = output.current_mode() else {
+                continue;
+            };
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let band = Rectangle::new(Point::from((0, band_y)), mode.size);
+            band_y += mode.size.h;
+
+            let ctx = RenderCtx {
+                renderer: &mut renderer,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            for elem in niri.render_to_vec(ctx, output, true) {
+                let elem = RelocateRenderElement::from_element(elem, band.loc, Relocate::Relative);
+                if let Some(elem) = CropRenderElement::from_element(elem, scale, band) {
+                    elements.push(elem);
+                }
+            }
+        }
+
+        // Split monitors do not use plane scanout; everything is composited.
+        let drm_compositor = &mut surface.compositor;
+        match drm_compositor.render_frame::<_, _>(
+            &mut renderer,
+            &elements,
+            [0.; 4],
+            FrameFlags::empty(),
+        ) {
+            Ok(res) => {
+                for output in &outputs {
+                    niri.update_primary_scanout_output(output, &res.states);
+                    if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
+                        niri.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
+                    }
+                }
+
+                if !res.is_empty {
+                    // FIXME: presentation feedback is only collected for the first band.
+                    let presentation_feedbacks =
+                        niri.take_presentation_feedbacks(&outputs[0], &res.states);
+                    let data = (presentation_feedbacks, target_presentation_time);
+
+                    match drm_compositor.queue_frame(data) {
+                        Ok(()) => {
+                            let render_state =
+                                niri.monitor_render_state.get_mut(&monitor_id).unwrap();
+                            let new_state = RedrawState::WaitingForVBlank {
+                                redraw_needed: false,
+                            };
+                            match mem::replace(&mut render_state.redraw_state, new_state) {
+                                RedrawState::Idle => unreachable!(),
+                                RedrawState::Queued => (),
+                                RedrawState::WaitingForVBlank { .. } => unreachable!(),
+                                RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
+                                RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                                    niri.event_loop.remove(token);
+                                }
+                            };
+
+                            for output in &outputs {
+                                let output_state = niri.output_state.get_mut(output).unwrap();
+                                output_state.frame_callback_sequence =
+                                    output_state.frame_callback_sequence.wrapping_add(1);
+                            }
+
+                            return RenderResult::Submitted;
+                        }
+                        Err(err) => {
+                            warn!("error queueing frame: {err}");
+                        }
+                    }
+                } else {
+                    rv = RenderResult::NoDamage;
+                }
+            }
+            Err(err) => {
+                warn!("error rendering frame: {err}");
+            }
+        }
+
+        drop(surface.vblank_frame.take());
+        queue_estimated_vblank_timer(niri, outputs[0].clone(), target_presentation_time);
         rv
     }
 
@@ -2259,9 +2478,11 @@ impl Tty {
     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
         let _span = tracy_client::span!("Tty::set_output_on_demand_vrr");
 
+        let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
         let output_state = niri.output_state.get_mut(output).unwrap();
         output_state.on_demand_vrr_enabled = enable_vrr;
-        if output_state.frame_clock.vrr() == enable_vrr {
+        let render_state = niri.monitor_render_state.get_mut(&monitor_id).unwrap();
+        if render_state.frame_clock.vrr() == enable_vrr {
             return;
         }
         for (&node, device) in self.devices.iter_mut() {
@@ -2275,7 +2496,7 @@ impl Tty {
                             surface.name.connector, word
                         );
                     }
-                    output_state
+                    render_state
                         .frame_clock
                         .set_vrr(surface.compositor.vrr_enabled());
 
@@ -2451,6 +2672,8 @@ impl Tty {
                     error!("missing state for output {:?}", surface.name.connector);
                     continue;
                 };
+                let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+                let render_state = niri.monitor_render_state.get_mut(&monitor_id).unwrap();
 
                 if (is_on_demand_vrr && vrr_enabled != output_state.on_demand_vrr_enabled)
                     || (!is_on_demand_vrr && change_always_vrr)
@@ -2463,7 +2686,7 @@ impl Tty {
                             surface.name.connector, word
                         );
                     }
-                    output_state
+                    render_state
                         .frame_clock
                         .set_vrr(surface.compositor.vrr_enabled());
                 }
@@ -2497,7 +2720,7 @@ impl Tty {
                     let wl_mode = Mode::from(mode);
                     output.change_current_state(Some(wl_mode), None, None, None);
                     output.set_preferred(wl_mode);
-                    output_state.frame_clock = FrameClock::new(
+                    render_state.frame_clock = FrameClock::new(
                         Some(refresh_interval(mode)),
                         surface.compositor.vrr_enabled(),
                     );
@@ -2938,14 +3161,19 @@ fn queue_estimated_vblank_timer(
     output: Output,
     target_presentation_time: Duration,
 ) {
-    let output_state = niri.output_state.get_mut(&output).unwrap();
-    match mem::take(&mut output_state.redraw_state) {
+    let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+    let redraw_state = &mut niri
+        .monitor_render_state
+        .get_mut(&monitor_id)
+        .unwrap()
+        .redraw_state;
+    match mem::take(redraw_state) {
         RedrawState::Idle => unreachable!(),
         RedrawState::Queued => (),
         RedrawState::WaitingForVBlank { .. } => unreachable!(),
         RedrawState::WaitingForEstimatedVBlank(token)
         | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-            output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+            *redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
             return;
         }
     }
@@ -2956,7 +3184,7 @@ fn queue_estimated_vblank_timer(
     // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
     // render(). This can happen for example with unknown presentation time from DRM.
     if duration.is_zero() {
-        duration += output_state
+        duration += niri.monitor_render_state[&monitor_id]
             .frame_clock
             .refresh_interval()
             // Unknown refresh interval, i.e. winit backend. Would be good to estimate it somehow
@@ -2976,7 +3204,10 @@ fn queue_estimated_vblank_timer(
             TimeoutAction::Drop
         })
         .unwrap();
-    output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+    niri.monitor_render_state
+        .get_mut(&monitor_id)
+        .unwrap()
+        .redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
 }
 
 pub fn calculate_drm_mode_from_modeline(modeline: &Modeline) -> anyhow::Result<DrmMode> {

@@ -265,6 +265,9 @@ pub struct Niri {
     /// linking it back here; see `physical_monitor_for_output`.
     pub physical_monitors: HashMap<PhysicalMonitorId, PhysicalMonitor>,
 
+    /// Per-physical-monitor render state, shared by all of a monitor's virtual outputs.
+    pub monitor_render_state: HashMap<PhysicalMonitorId, MonitorRenderState>,
+
     // When false, we're idling with monitors powered off.
     pub monitors_active: bool,
 
@@ -452,16 +455,23 @@ pub struct DndIcon {
     pub offset: Point<i32, Logical>,
 }
 
-pub struct OutputState {
-    pub global: GlobalId,
+/// Render state shared by all virtual outputs of one physical monitor.
+///
+/// These fields track the single CRTC and vblank cycle behind the monitor, so they are
+/// stored once per physical monitor rather than duplicated per virtual output.
+pub struct MonitorRenderState {
     pub frame_clock: FrameClock,
     pub redraw_state: RedrawState,
-    pub on_demand_vrr_enabled: bool,
-    // After the last redraw, some ongoing animations still remain.
-    pub unfinished_animations_remain: bool,
     /// Last sequence received in a vblank event.
     pub last_drm_sequence: Option<u32>,
     pub vblank_throttle: VBlankThrottle,
+}
+
+pub struct OutputState {
+    pub global: GlobalId,
+    pub on_demand_vrr_enabled: bool,
+    // After the last redraw, some ongoing animations still remain.
+    pub unfinished_animations_remain: bool,
     /// Sequence for frame callback throttling.
     ///
     /// We want to send frame callbacks for each surface at most once per monitor refresh cycle.
@@ -2510,6 +2520,7 @@ impl Niri {
             sorted_outputs: Vec::default(),
             output_state: HashMap::new(),
             physical_monitors: HashMap::new(),
+            monitor_render_state: HashMap::new(),
             unmapped_windows: HashMap::new(),
             unmapped_layer_surfaces: HashSet::new(),
             mapped_layer_surfaces: HashMap::new(),
@@ -2870,27 +2881,40 @@ impl Niri {
         for output in &outputs {
             output.user_data().insert_if_missing(|| monitor_id);
         }
+
+        // The vblank-timing state is shared by all of the monitor's virtual outputs.
+        let render_state = MonitorRenderState {
+            frame_clock: FrameClock::new(refresh_interval, vrr),
+            redraw_state: RedrawState::Idle,
+            last_drm_sequence: None,
+            vblank_throttle: VBlankThrottle::new(
+                self.event_loop.clone(),
+                monitor.name().connector.clone(),
+            ),
+        };
+        let rv = self.monitor_render_state.insert(monitor_id, render_state);
+        assert!(rv.is_none(), "physical monitor was already tracked");
+
         let rv = self.physical_monitors.insert(monitor_id, monitor);
         assert!(rv.is_none(), "physical monitor was already tracked");
 
         // Add each virtual output. `outputs` is in top-to-bottom band order.
         for output in outputs {
-            self.add_virtual_output(output, refresh_interval, vrr);
+            self.add_virtual_output(output);
         }
     }
 
-    fn add_virtual_output(
-        &mut self,
-        output: Output,
-        refresh_interval: Option<Duration>,
-        vrr: bool,
-    ) {
+    fn add_virtual_output(&mut self, output: Output) {
         let global = output.create_global::<State>(&self.display_handle);
 
         let name = output.user_data().get::<OutputName>().unwrap();
 
+        // Resolve config by the physical monitor's name, so that a split monitor's bands all
+        // inherit the same `output "..."` config block (scale, transform, layout, ...).
+        let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+        let monitor_name = self.physical_monitors[&monitor_id].name().clone();
         let config = self.config.borrow();
-        let c = config.outputs.find(name);
+        let c = config.outputs.find(&monitor_name);
         let scale = c.and_then(|c| c.scale).map(|s| s.0).unwrap_or_else(|| {
             let size_mm = output.physical_properties().size;
             let resolution = output.current_mode().unwrap().size;
@@ -2942,12 +2966,8 @@ impl Niri {
         let size = output_size(&output);
         let state = OutputState {
             global,
-            redraw_state: RedrawState::Idle,
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
-            frame_clock: FrameClock::new(refresh_interval, vrr),
-            last_drm_sequence: None,
-            vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),
             frame_callback_sequence: 0,
             backdrop_buffer: SolidColorBuffer::new(size, backdrop_color),
             xray: Xray::new(),
@@ -2996,18 +3016,26 @@ impl Niri {
 
         let state = self.output_state.remove(output).unwrap();
 
-        // Drop the physical monitor hosting this output. Phase 1 invariant: one output per
-        // monitor, so removing the output removes the monitor.
-        if let Some(id) = output.user_data().get::<PhysicalMonitorId>() {
-            self.physical_monitors.remove(id);
-        }
-
-        match state.redraw_state {
-            RedrawState::Idle => (),
-            RedrawState::Queued => (),
-            RedrawState::WaitingForVBlank { .. } => (),
-            RedrawState::WaitingForEstimatedVBlank(token) => self.event_loop.remove(token),
-            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => self.event_loop.remove(token),
+        // Drop the physical monitor and its render state once its last virtual output is gone.
+        if let Some(&id) = output.user_data().get::<PhysicalMonitorId>() {
+            let monitor_still_used = self
+                .output_state
+                .keys()
+                .any(|o| o.user_data().get::<PhysicalMonitorId>() == Some(&id));
+            if !monitor_still_used {
+                self.physical_monitors.remove(&id);
+                if let Some(render_state) = self.monitor_render_state.remove(&id) {
+                    match render_state.redraw_state {
+                        RedrawState::Idle
+                        | RedrawState::Queued
+                        | RedrawState::WaitingForVBlank { .. } => (),
+                        RedrawState::WaitingForEstimatedVBlank(token)
+                        | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                            self.event_loop.remove(token)
+                        }
+                    }
+                }
+            }
         }
 
         self.stop_casts_for_target(CastTarget::output(output));
@@ -3748,31 +3776,31 @@ impl Niri {
         state.lock_surface.as_ref().map(|s| s.wl_surface()).cloned()
     }
 
-    /// Schedules an immediate redraw on all outputs if one is not already scheduled.
+    /// Schedules an immediate redraw on all monitors if one is not already scheduled.
     pub fn queue_redraw_all(&mut self) {
-        for state in self.output_state.values_mut() {
+        for state in self.monitor_render_state.values_mut() {
             state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
         }
     }
 
-    /// Schedules an immediate redraw if one is not already scheduled.
+    /// Schedules an immediate redraw of the output's monitor if one is not already scheduled.
     pub fn queue_redraw(&mut self, output: &Output) {
-        let state = self.output_state.get_mut(output).unwrap();
+        let id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+        let state = self.monitor_render_state.get_mut(&id).unwrap();
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }
 
     pub fn redraw_queued_outputs(&mut self, backend: &mut Backend) {
         let _span = tracy_client::span!("Niri::redraw_queued_outputs");
 
-        while let Some((output, _)) = self.output_state.iter().find(|(_, state)| {
+        while let Some((&monitor_id, _)) = self.monitor_render_state.iter().find(|(_, state)| {
             matches!(
                 state.redraw_state,
                 RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
             )
         }) {
-            trace!("redrawing output");
-            let output = output.clone();
-            self.redraw(backend, &output);
+            trace!("redrawing monitor");
+            self.redraw_monitor(backend, monitor_id);
         }
     }
 
@@ -4668,59 +4696,70 @@ impl Niri {
         }
     }
 
-    fn redraw(&mut self, backend: &mut Backend, output: &Output) {
-        let _span = tracy_client::span!("Niri::redraw");
+    /// Redraws one physical monitor: renders all of its virtual outputs and submits a frame.
+    fn redraw_monitor(&mut self, backend: &mut Backend, monitor_id: PhysicalMonitorId) {
+        let _span = tracy_client::span!("Niri::redraw_monitor");
+
+        // The monitor's virtual outputs, in top-to-bottom band order.
+        let outputs: Vec<Output> = self.physical_monitors[&monitor_id].outputs().to_vec();
 
         // Verify our invariant.
-        let state = self.output_state.get_mut(output).unwrap();
         assert!(matches!(
-            state.redraw_state,
+            self.monitor_render_state[&monitor_id].redraw_state,
             RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
         ));
 
-        let target_presentation_time = state.frame_clock.next_presentation_time();
+        let target_presentation_time = self.monitor_render_state[&monitor_id]
+            .frame_clock
+            .next_presentation_time();
 
         // Freeze the clock at the target time.
         self.clock.set_unadjusted(target_presentation_time);
 
-        self.update_render_elements(Some(output));
+        for output in &outputs {
+            self.update_render_elements(Some(output));
+        }
 
         let mut res = RenderResult::Skipped;
         if self.monitors_active {
-            let state = self.output_state.get_mut(output).unwrap();
-            state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
-            state.unfinished_animations_remain |=
-                self.config_error_notification.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
-            state.unfinished_animations_remain |= state.screen_transition.is_some();
+            for output in &outputs {
+                let mut unfinished = self.layout.are_animations_ongoing(Some(output))
+                    || self.config_error_notification.are_animations_ongoing()
+                    || self.exit_confirm_dialog.are_animations_ongoing()
+                    || self.screenshot_ui.are_animations_ongoing()
+                    || self.window_mru_ui.are_animations_ongoing()
+                    || self.output_state[output].screen_transition.is_some()
+                    // Also keep redrawing if the current cursor is animated.
+                    || self
+                        .cursor_manager
+                        .is_current_cursor_animated(output.current_scale().integer_scale());
 
-            // Also keep redrawing if the current cursor is animated.
-            state.unfinished_animations_remain |= self
-                .cursor_manager
-                .is_current_cursor_animated(output.current_scale().integer_scale());
+                // Also check layer surfaces.
+                if !unfinished {
+                    unfinished = layer_map_for_output(output)
+                        .layers()
+                        .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
+                        .any(|mapped| mapped.are_animations_ongoing());
+                }
 
-            // Also check layer surfaces.
-            if !state.unfinished_animations_remain {
-                state.unfinished_animations_remain |= layer_map_for_output(output)
-                    .layers()
-                    .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
-                    .any(|mapped| mapped.are_animations_ongoing());
+                self.output_state
+                    .get_mut(output)
+                    .unwrap()
+                    .unfinished_animations_remain = unfinished;
             }
 
-            // Render.
-            res = backend.render(self, output, target_presentation_time);
+            // Render the whole monitor.
+            res = backend.render(self, monitor_id, target_presentation_time);
         }
 
         let is_locked = self.is_locked();
-        let state = self.output_state.get_mut(output).unwrap();
 
         if res == RenderResult::Skipped {
             // Update the redraw state on failed render.
-            state.redraw_state = if let RedrawState::WaitingForEstimatedVBlank(token)
+            let render_state = self.monitor_render_state.get_mut(&monitor_id).unwrap();
+            render_state.redraw_state = if let RedrawState::WaitingForEstimatedVBlank(token)
             | RedrawState::WaitingForEstimatedVBlankAndQueued(token) =
-                state.redraw_state
+                render_state.redraw_state
             {
                 RedrawState::WaitingForEstimatedVBlank(token)
             } else {
@@ -4732,18 +4771,23 @@ impl Niri {
         // monitors are inactive on a TTY, they have no framebuffer attached, so no sensitive data
         // from a last render will be visible.
         if res != RenderResult::Skipped || !self.monitors_active {
-            state.lock_render_state = if is_locked {
-                LockRenderState::Locked
-            } else {
-                LockRenderState::Unlocked
-            };
+            for output in &outputs {
+                self.output_state.get_mut(output).unwrap().lock_render_state = if is_locked {
+                    LockRenderState::Locked
+                } else {
+                    LockRenderState::Unlocked
+                };
+            }
         }
 
         // If we're in process of locking the session, check if the requirements were met.
         match mem::take(&mut self.lock_state) {
             LockState::Locking(confirmation) => {
-                if state.lock_render_state == LockRenderState::Unlocked {
-                    // We needed to render a locked frame on this output but failed.
+                let monitor_unlocked = outputs.iter().any(|output| {
+                    self.output_state[output].lock_render_state == LockRenderState::Unlocked
+                });
+                if monitor_unlocked {
+                    // We needed to render a locked frame on this monitor but failed.
                     self.unlock();
                 } else {
                     // Check if all outputs are now locked.
@@ -4766,35 +4810,42 @@ impl Niri {
             lock_state => self.lock_state = lock_state,
         }
 
-        self.refresh_on_demand_vrr(backend, output);
+        for output in &outputs {
+            self.refresh_on_demand_vrr(backend, output);
 
-        // Send the frame callbacks.
-        //
-        // FIXME: The logic here could be a bit smarter. Currently, during an animation, the
-        // surfaces that are visible for the very last frame (e.g. because the camera is moving
-        // away) will receive frame callbacks, and the surfaces that are invisible but will become
-        // visible next frame will not receive frame callbacks (so they will show stale contents for
-        // one frame). We could advance the animations for the next frame and send frame callbacks
-        // according to the expected new positions.
-        //
-        // However, this should probably be restricted to sending frame callbacks to more surfaces,
-        // to err on the safe side.
-        self.send_frame_callbacks(output);
-        backend.with_primary_renderer(|renderer| {
-            #[cfg(feature = "xdp-gnome-screencast")]
-            {
-                // Render and send to PipeWire screencast streams.
-                self.render_for_screen_cast(renderer, output, target_presentation_time);
+            // Send the frame callbacks.
+            //
+            // FIXME: The logic here could be a bit smarter. Currently, during an animation, the
+            // surfaces that are visible for the very last frame (e.g. because the camera is moving
+            // away) will receive frame callbacks, and the surfaces that are invisible but will
+            // become visible next frame will not receive frame callbacks (so they will show stale
+            // contents for one frame). We could advance the animations for the next frame and send
+            // frame callbacks according to the expected new positions.
+            //
+            // However, this should probably be restricted to sending frame callbacks to more
+            // surfaces, to err on the safe side.
+            self.send_frame_callbacks(output);
 
-                // FIXME: when a window is hidden, it should probably still receive frame callbacks
-                // and get rendered for screen cast. This is currently
-                // unimplemented, but happens to work by chance, since output
-                // redrawing is more eager than it should be.
-                self.render_windows_for_screen_cast(renderer, output, target_presentation_time);
-            }
+            backend.with_primary_renderer(|renderer| {
+                #[cfg(feature = "xdp-gnome-screencast")]
+                {
+                    // Render and send to PipeWire screencast streams.
+                    self.render_for_screen_cast(renderer, output, target_presentation_time);
 
-            self.render_for_screencopy_with_damage(renderer, output);
-        });
+                    // FIXME: when a window is hidden, it should probably still receive frame
+                    // callbacks and get rendered for screen cast. This is currently unimplemented,
+                    // but happens to work by chance, since output redrawing is more eager than it
+                    // should be.
+                    self.render_windows_for_screen_cast(
+                        renderer,
+                        output,
+                        target_presentation_time,
+                    );
+                }
+
+                self.render_for_screencopy_with_damage(renderer, output);
+            });
+        }
     }
 
     pub fn refresh_on_demand_vrr(&mut self, backend: &mut Backend, output: &Output) {

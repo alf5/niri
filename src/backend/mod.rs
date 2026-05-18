@@ -9,6 +9,7 @@ use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::niri::Niri;
+use crate::physical_monitor::PhysicalMonitorId;
 use crate::utils::id::IdCounter;
 
 pub mod tty;
@@ -86,13 +87,17 @@ impl Backend {
     pub fn render(
         &mut self,
         niri: &mut Niri,
-        output: &Output,
+        monitor_id: PhysicalMonitorId,
         target_presentation_time: Duration,
     ) -> RenderResult {
         match self {
-            Backend::Tty(tty) => tty.render(niri, output, target_presentation_time),
-            Backend::Winit(winit) => winit.render(niri, output),
-            Backend::Headless(headless) => headless.render(niri, output),
+            Backend::Tty(tty) => tty.render(niri, monitor_id, target_presentation_time),
+            Backend::Headless(headless) => headless.render(niri, monitor_id),
+            Backend::Winit(winit) => {
+                // winit always hosts a single virtual output spanning the whole window.
+                let output = niri.physical_monitors[&monitor_id].output().clone();
+                winit.render(niri, &output)
+            }
         }
     }
 

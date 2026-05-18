@@ -3,6 +3,7 @@
 use niri_config::{Config, Output as OutputConfig, Outputs};
 
 use super::*;
+use crate::niri::RedrawState;
 
 /// Builds a config that splits the given headless monitor into `rows` virtual outputs.
 fn config_with_rows(monitor: &str, rows: u16) -> Config {
@@ -92,6 +93,27 @@ fn split_monitor_does_not_shift_other_monitors() {
     let geo = niri.global_space.output_geometry(second).unwrap();
     assert_eq!((geo.loc.x, geo.loc.y), (1920, 0));
     assert_eq!((geo.size.w, geo.size.h), (1280, 720));
+}
+
+#[test]
+fn split_monitor_redraws_without_panic() {
+    let mut f = Fixture::with_config(config_with_rows("headless-1", 2));
+    f.add_output(1, (1920, 1080));
+
+    // Queueing a redraw via one band schedules the whole physical monitor.
+    let output = f.niri().global_space.outputs().next().cloned().unwrap();
+    f.niri().queue_redraw(&output);
+
+    // Redrawing the monitor must walk both virtual outputs without panicking.
+    let state = f.niri_state();
+    state.niri.redraw_queued_outputs(&mut state.backend);
+
+    // The monitor's shared redraw state has left the Queued state.
+    let niri = f.niri();
+    assert!(niri.monitor_render_state.values().all(|s| !matches!(
+        s.redraw_state,
+        RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+    )));
 }
 
 #[test]

@@ -23,7 +23,7 @@ use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState, State};
-use crate::physical_monitor::PhysicalMonitor;
+use crate::physical_monitor::{PhysicalMonitor, PhysicalMonitorId};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
@@ -284,8 +284,9 @@ impl Winit {
             rv = RenderResult::NoDamage;
         }
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
-        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+        let monitor_id = *output.user_data().get::<PhysicalMonitorId>().unwrap();
+        let render_state = niri.monitor_render_state.get_mut(&monitor_id).unwrap();
+        match mem::replace(&mut render_state.redraw_state, RedrawState::Idle) {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
@@ -293,6 +294,7 @@ impl Winit {
             RedrawState::WaitingForEstimatedVBlankAndQueued(_) => unreachable!(),
         }
 
+        let output_state = niri.output_state.get_mut(output).unwrap();
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
         // FIXME: this should wait until a frame callback from the host compositor, but it redraws

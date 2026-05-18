@@ -20,7 +20,7 @@ use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState};
-use crate::physical_monitor::{band_rectangles, PhysicalMonitor};
+use crate::physical_monitor::{band_rectangles, PhysicalMonitor, PhysicalMonitorId};
 use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
 
@@ -169,18 +169,24 @@ impl Headless {
         self.renderer.as_mut().map(f)
     }
 
-    pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
-        let states = RenderElementStates::default();
-        let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
-        presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
-            get_monotonic_time(),
-            Refresh::Unknown,
-            0,
-            wp_presentation_feedback::Kind::empty(),
-        );
+    pub fn render(&mut self, niri: &mut Niri, monitor_id: PhysicalMonitorId) -> RenderResult {
+        let outputs: Vec<Output> = niri.physical_monitors[&monitor_id].outputs().to_vec();
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
-        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+        // Presentation feedback is per virtual output.
+        for output in &outputs {
+            let states = RenderElementStates::default();
+            let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
+            presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
+                get_monotonic_time(),
+                Refresh::Unknown,
+                0,
+                wp_presentation_feedback::Kind::empty(),
+            );
+        }
+
+        // The redraw state is shared by all of the monitor's virtual outputs.
+        let render_state = niri.monitor_render_state.get_mut(&monitor_id).unwrap();
+        match mem::replace(&mut render_state.redraw_state, RedrawState::Idle) {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
@@ -188,7 +194,11 @@ impl Headless {
             RedrawState::WaitingForEstimatedVBlankAndQueued(_) => unreachable!(),
         }
 
-        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
+        for output in &outputs {
+            let output_state = niri.output_state.get_mut(output).unwrap();
+            output_state.frame_callback_sequence =
+                output_state.frame_callback_sequence.wrapping_add(1);
+        }
 
         // FIXME: request redraw on unfinished animations remain
 
