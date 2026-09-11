@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::iter::zip;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,6 +52,7 @@ use smithay::reexports::drm::control::{
 use smithay::reexports::gbm::Modifier;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::udev as libudev;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{DeviceFd, Point, Rectangle, Scale, Size, Transform};
@@ -503,7 +504,7 @@ impl Tty {
         let (primary_node, primary_render_node) = primary_node_from_config(&config.borrow())
             .ok_or(())
             .or_else(|()| {
-                let primary_gpu_path = udev::primary_gpu(&seat_name)
+                let primary_gpu_path = primary_gpu(&seat_name)
                     .context("error getting the primary GPU")?
                     .context("couldn't find a GPU")?;
                 let primary_node = DrmNode::from_path(primary_gpu_path)
@@ -3029,6 +3030,88 @@ fn primary_node_from_config(config: &Config) -> Option<(DrmNode, DrmNode)> {
     primary_node_from_render_node(path)
 }
 
+/// Finds the GPU to render on when the config doesn't set one; see `pick_primary_gpu()`.
+fn primary_gpu(seat: &str) -> io::Result<Option<PathBuf>> {
+    let gpus: Vec<_> = udev::all_gpus(seat)?
+        .into_iter()
+        .map(GpuInfo::new)
+        .collect();
+    debug!("GPUs: {gpus:?}");
+
+    Ok(pick_primary_gpu(&gpus).map(|gpu| gpu.path.clone()))
+}
+
+#[derive(Debug)]
+struct GpuInfo {
+    path: PathBuf,
+    boot_vga: bool,
+    has_render_node: bool,
+    has_monitor: bool,
+}
+
+impl GpuInfo {
+    fn new(path: PathBuf) -> Self {
+        let node = DrmNode::from_path(&path).ok();
+        let has_render_node = node
+            .and_then(|node| node.node_with_type(NodeType::Render))
+            .is_some_and(|res| res.is_ok());
+
+        let device = node.and_then(|node| {
+            libudev::Device::from_devnum(libudev::DeviceType::Character, node.dev_id()).ok()
+        });
+        let boot_vga = device.as_ref().is_some_and(is_boot_vga);
+        let has_monitor = device
+            .as_ref()
+            .is_some_and(|device| has_connected_connector(device).unwrap_or(false));
+
+        Self {
+            path,
+            boot_vga,
+            has_render_node,
+            has_monitor,
+        }
+    }
+}
+
+// Same check as smithay's udev::primary_gpu().
+fn is_boot_vga(device: &libudev::Device) -> bool {
+    let Ok(Some(pci)) = device.parent_with_subsystem("pci") else {
+        return false;
+    };
+    pci.attribute_value("boot_vga").is_some_and(|id| id == "1")
+}
+
+fn has_connected_connector(device: &libudev::Device) -> io::Result<bool> {
+    let mut enumerator = libudev::Enumerator::new()?;
+    enumerator.match_subsystem("drm")?;
+    // Matches the card itself too, but it has no status attribute.
+    enumerator.match_parent(device)?;
+
+    let connected = enumerator.scan_devices()?.any(|device| {
+        device
+            .attribute_value("status")
+            .is_some_and(|status| status == "connected")
+    });
+    Ok(connected)
+}
+
+/// Picks the GPU to render on out of the seat's GPUs, sorted by path.
+///
+/// Follows smithay's `udev::primary_gpu()` (boot VGA, then the first with a render node, then the
+/// first), except that without a boot VGA GPU we prefer one with a monitor connected. Otherwise,
+/// with e.g. an APU plus an eGPU that drives all monitors, we'd pick the APU and copy every frame
+/// over to the eGPU.
+fn pick_primary_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
+    gpus.iter()
+        .find(|gpu| gpu.boot_vga)
+        .or_else(|| {
+            gpus.iter()
+                .find(|gpu| gpu.has_render_node && gpu.has_monitor)
+        })
+        .or_else(|| gpus.iter().find(|gpu| gpu.has_render_node))
+        .or_else(|| gpus.first())
+}
+
 fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {
     let mut disabled_nodes = HashSet::new();
 
@@ -3704,11 +3787,89 @@ unsafe fn init_libinput_plugin_system(libinput: &Libinput) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use insta::assert_debug_snapshot;
     use niri_config::output::Modeline;
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
 
-    use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt};
+    use crate::backend::tty::{
+        calculate_drm_mode_from_modeline, calculate_mode_cvt, pick_primary_gpu, GpuInfo,
+    };
+
+    fn gpu(path: &str) -> GpuInfo {
+        GpuInfo {
+            path: PathBuf::from(path),
+            boot_vga: false,
+            has_render_node: true,
+            has_monitor: false,
+        }
+    }
+
+    fn picked(gpus: &[GpuInfo]) -> Option<&Path> {
+        pick_primary_gpu(gpus).map(|gpu| gpu.path.as_path())
+    }
+
+    #[test]
+    fn test_primary_gpu_prefers_boot_vga() {
+        // Even over a GPU with the monitors, as before.
+        let gpus = [
+            GpuInfo {
+                has_monitor: true,
+                ..gpu("/dev/dri/card0")
+            },
+            GpuInfo {
+                boot_vga: true,
+                ..gpu("/dev/dri/card1")
+            },
+        ];
+        assert_eq!(picked(&gpus), Some(Path::new("/dev/dri/card1")));
+    }
+
+    #[test]
+    fn test_primary_gpu_prefers_monitor_without_boot_vga() {
+        // E.g. an APU (a display controller, so no boot_vga) plus an eGPU with all the monitors.
+        let gpus = [
+            gpu("/dev/dri/card0"),
+            GpuInfo {
+                has_monitor: true,
+                ..gpu("/dev/dri/card1")
+            },
+        ];
+        assert_eq!(picked(&gpus), Some(Path::new("/dev/dri/card1")));
+    }
+
+    #[test]
+    fn test_primary_gpu_skips_monitor_without_render_node() {
+        // E.g. a DisplayLink adapter: has the monitor but can't render.
+        let gpus = [
+            gpu("/dev/dri/card0"),
+            GpuInfo {
+                has_render_node: false,
+                has_monitor: true,
+                ..gpu("/dev/dri/card1")
+            },
+        ];
+        assert_eq!(picked(&gpus), Some(Path::new("/dev/dri/card0")));
+    }
+
+    #[test]
+    fn test_primary_gpu_fallbacks() {
+        let no_render_node = GpuInfo {
+            has_render_node: false,
+            ..gpu("/dev/dri/card0")
+        };
+        let gpus = [no_render_node, gpu("/dev/dri/card1")];
+        assert_eq!(picked(&gpus), Some(Path::new("/dev/dri/card1")));
+
+        let gpus = [GpuInfo {
+            has_render_node: false,
+            ..gpu("/dev/dri/card0")
+        }];
+        assert_eq!(picked(&gpus), Some(Path::new("/dev/dri/card0")));
+
+        assert_eq!(picked(&[]), None);
+    }
 
     #[test]
     fn test_calculate_drmmode_from_modeline() {
